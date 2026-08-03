@@ -1,0 +1,2 @@
+# Tested against 0.120.2; earlier versions may predate output_config/effort.
+anthropic>=0.120
