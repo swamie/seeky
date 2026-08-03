@@ -378,6 +378,13 @@ def main():
     me, counts = choose_me(messages)
     name = input("What should the clone be called? [me]: ").strip() or "me"
 
+    # The clone plays you, so the human seat is the other person's. Label the
+    # input prompt with their name — "you>" reads as though you're typing as
+    # yourself, which is backwards.
+    other = next((who for who, _ in counts.most_common() if who != me), "them")
+    if other.startswith("__"):
+        other = "them"
+
     sessions = build_turns(messages, me)
     style, count = style_card(sessions, name)
     if not style:
@@ -404,11 +411,12 @@ def main():
     history = []
 
     print(f"\nLearned from {count:,} of your messages, {len(examples)} exchanges in the prompt.")
+    print(f"You're texting as {other}; {name} replies as you.")
     print("Type /reset to start over, /style to see your profile, /quit to leave.\n")
 
     while True:
         try:
-            said = input("you> ").strip()
+            said = input(f"{other.lower()}> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
