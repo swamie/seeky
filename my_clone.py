@@ -36,9 +36,11 @@ SENDER_KEYS = ("sender", "name", "from", "author", "sender_name", "senderName")
 TIME_KEYS = ("timestamp", "sent_at", "sentAt", "timestamp_ms", "date", "sent", "time")
 SKIP_TEXT = {"", "media message", "attachment", "sticker", "(no text)", "null", "none"}
 
+# U+FE0F (variation selector) is deliberately absent — it's a modifier that
+# trails other emoji, and counting it alone puts an invisible "emoji" in the list.
 EMOJI_RE = re.compile(
     "[\U0001f300-\U0001faff\U00002600-\U000027bf\U0001f1e6-\U0001f1ff"
-    "\U00002b00-\U00002bff\U0000fe0f\U00002190-\U000021ff]"
+    "\U00002b00-\U00002bff\U00002190-\U000021ff]"
 )
 WORD_RE = re.compile(r"[a-z']{2,}")
 LEAKED_TAGS = re.compile(r"<thinking>.*?</thinking>\s*", re.DOTALL | re.IGNORECASE)
@@ -61,6 +63,34 @@ SLANG = {
     "probs", "def", "af", "istg", "wyd", "hbu", "lowkey", "deadass", "bet",
     "babe", "baby", "love", "miss", "cute", "aww", "xx",
 }
+
+
+def load_chat(path):
+    """Read the file as JSON, or as JSON Lines if that fails.
+
+    Plenty of exporters write one object per line rather than a single
+    document, which json.loads rejects with a confusing "Extra data" error.
+    """
+    raw = path.read_text(encoding="utf-8")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    records, bad = [], 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            bad += 1
+    if not records:
+        sys.exit(f"{path} isn't valid JSON or JSON Lines.")
+    if bad:
+        print(f"Note: skipped {bad:,} unreadable line(s).", file=sys.stderr)
+    return records
 
 
 def find_messages(obj):
@@ -94,6 +124,13 @@ def field(msg, keys):
 
 
 def text_of(msg):
+    # Call logs and deleted messages carry body text that reads like something
+    # you actually typed ("Outgoing voice call (unanswered)"), so they have to
+    # be filtered on their flags — matching on the words would miss them and
+    # they'd end up in the style profile.
+    for flag in ("deleted", "call", "missed"):
+        if msg.get(flag) is True:
+            return ""
     value = field(msg, BODY_KEYS)
     if not isinstance(value, str):
         return ""
@@ -160,24 +197,31 @@ def build_turns(messages, me):
     return sessions
 
 
-def build_examples(sessions, limit):
-    """Blocks that start with them and end with you. Never overlapping."""
+def build_examples(sessions, limit, max_turns=6):
+    """Blocks that start with them and end with you, tiled so none overlap.
+
+    Tiling matters: an earlier version walked to each of your turns and reached
+    backwards, but since conversation alternates, the no-overlap rule squeezed
+    every block down to a bare two-turn ping-pong with no context in it. Cutting
+    the session into consecutive windows keeps several turns of real
+    back-and-forth per example.
+    """
     blocks = []
     for turns in sessions:
-        used = -1
-        for i, (speaker, _) in enumerate(turns):
-            if speaker != "me" or i == 0 or turns[i - 1][0] != "them":
-                continue
-            start = max(used + 1, i - 5)
-            while start < i and turns[start][0] != "them":
+        for i in range(0, len(turns), max_turns):
+            window = turns[i : i + max_turns]
+            start = 0
+            while start < len(window) and window[start][0] != "them":
                 start += 1
-            if start >= i:
+            end = len(window) - 1
+            while end >= 0 and window[end][0] != "me":
+                end -= 1
+            if start >= end:
                 continue
-            block = turns[start : i + 1]
+            block = window[start : end + 1]
             if sum(len(p) for _, parts in block for p in parts) > 1200:
                 continue
             blocks.append(block)
-            used = i
     if len(blocks) <= limit:
         return blocks
     # Sample evenly across the whole history so the mix of long and one-word
@@ -207,7 +251,13 @@ def style_card(sessions, name):
     for m in msgs:
         words.update(WORD_RE.findall(m.lower()))
     slang = [(w, c) for w, c in words.most_common() if w in SLANG][:12]
-    common = [w for w, _ in words.most_common() if w not in STOPWORDS and w not in SLANG][:12]
+    # Length floor: two- and three-letter words are almost all glue ("it", "to",
+    # "so") and crowd out anything that actually sounds like you. Short words
+    # worth keeping are already caught as slang above.
+    common = [
+        w for w, _ in words.most_common()
+        if len(w) >= 4 and w not in STOPWORDS and w not in SLANG
+    ][:12]
 
     lines = [
         f"- Measured from {len(msgs):,} real messages sent by {name}.",
@@ -288,6 +338,15 @@ def choose_me(messages):
     if len(people) == 1:
         return people[0][0], counts
 
+    # Exports commonly label your own side "Me". The list is ordered by volume,
+    # so without this the obvious pick is whoever talked more — which is often
+    # the other person, and you'd clone them instead.
+    labelled = [who for who, _ in people if who.lower() in ("me", "you", "self", "myself")]
+    if len(labelled) == 1:
+        others = ", ".join(w for w, _ in people if w != labelled[0])
+        print(f"You are {labelled[0]!r} in this export (talking to {others}).")
+        return labelled[0], counts
+
     print("Found these people in the chat:")
     for i, (who, count) in enumerate(people, 1):
         print(f"  {i}. {who} ({count:,} messages)")
@@ -307,12 +366,7 @@ def main():
             f"or run: python my_clone.py path/to/your-file.json"
         )
 
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        sys.exit(f"{path} isn't valid JSON: {exc}")
-
-    messages = find_messages(data)
+    messages = find_messages(load_chat(path))
     if not messages:
         sys.exit(f"Couldn't find any messages in {path}. Is this a chat export?")
 

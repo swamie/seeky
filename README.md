@@ -51,10 +51,16 @@ Second, **~80 real exchanges**, each starting with them and ending with you, so
 every example demonstrates the thing being copied. They're sampled evenly across
 your whole history so the mix of long replies and one-word replies stays true.
 
-The JSON reader doesn't assume one exact schema — it probes the common key names
-for the message body, sender, and timestamp, and handles a plain list, a
-`{"messages": [...]}` wrapper, or a dict keyed by name. If your export uses
-something unusual it'll say what it found instead of guessing.
+The reader accepts both plain JSON and **JSON Lines** (one object per line), and
+doesn't assume one exact schema — it probes the common key names for body,
+sender, and timestamp, and handles a plain list, a `{"messages": [...]}` wrapper,
+or a dict keyed by name. Call logs, deleted messages, and attachment-only rows
+are dropped; call entries in particular carry body text that reads like a real
+message (`"Outgoing voice call (unanswered)"`), so they're filtered on their
+flags rather than their wording.
+
+If one sender is labelled `Me` it's assumed to be you, so there's nothing to
+pick. Otherwise it lists everyone and asks.
 
 ## Notes
 
