@@ -62,6 +62,33 @@ flags rather than their wording.
 If one sender is labelled `Me` it's assumed to be you, so there's nothing to
 pick. Otherwise it lists everyone and asks.
 
+## Feeding it the whole history
+
+By default the prompt carries ~80 sampled exchanges — enough to nail your voice,
+but the clone doesn't know what actually happened between you. To put **every**
+message in instead, set `FULL_HISTORY = True` near the top of `my_clone.py`.
+
+It's a real tradeoff. Measured on an 82,503-message export:
+
+| | tokens | first reply | each later reply |
+|---|---|---|---|
+| 80 examples (default) | 14,475 | $0.09 | **$0.007** |
+| 500 examples | 77,418 | $0.48 | $0.039 |
+| 2,000 examples | 311,482 | $1.95 | $0.156 |
+| `FULL_HISTORY` | 951,462 | $5.95 | $0.48 |
+
+Two things to know before flipping it:
+
+- **It only just fits.** 951K of a 1M-token window leaves ~48K for everything
+  else. A bigger export won't fit at all, so the script counts tokens at startup
+  and refuses rather than failing mid-chat.
+- **The cache expires after 5 minutes idle**, and texting has gaps — so the
+  expensive first write can recur all session. `FULL_HISTORY` switches the cache
+  to a 1-hour TTL to blunt that.
+
+Raising `EXAMPLES` is usually the better move: 500 examples is 7% of your history
+for under 4c a reply.
+
 ## Notes
 
 - **Your messages get sent to the API** as part of the prompt — including your

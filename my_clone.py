@@ -27,7 +27,16 @@ API_KEY = ""
 
 CHAT_FILE = "chat.json"      # or: python my_clone.py some-other-file.json
 MODEL = "claude-opus-5"
-EXAMPLES = 80                # how many real exchanges go in the prompt
+
+# Put EVERY message in the prompt instead of a sample. The clone then knows what
+# actually happened between you, not just how you write — but it costs roughly
+# 66x more per reply, and the whole history has to fit in the model's 1M-token
+# context window. The script measures yours at startup and refuses if it won't
+# fit. Cache TTL goes to 1h when this is on, so gaps between messages don't keep
+# re-billing the expensive first write.
+FULL_HISTORY = False
+
+EXAMPLES = 80                # how many real exchanges go in the prompt (ignored if FULL_HISTORY)
 MAX_TOKENS = 400             # texts are short; keeps replies from turning into essays
 HISTORY_TURNS = 24           # how much of the live chat to remember
 
@@ -286,6 +295,19 @@ def style_card(sessions, name):
     return "\n".join(lines), len(msgs)
 
 
+def render_all(sessions, name):
+    """Every message you have, grouped by conversation. Used by FULL_HISTORY."""
+    out = []
+    for i, turns in enumerate(sessions, 1):
+        lines = [f'<conversation id="{i}">']
+        for speaker, parts in turns:
+            who = name if speaker == "me" else "THEM"
+            lines.extend(f"{who}: {p}" for p in parts)
+        lines.append("</conversation>")
+        out.append("\n".join(lines))
+    return "\n\n".join(out)
+
+
 def render_examples(blocks, name):
     out = []
     for i, block in enumerate(blocks, 1):
@@ -390,8 +412,14 @@ def main():
     if not style:
         sys.exit(f"Found {len(messages)} messages but none from you. Try again and pick a different person.")
 
-    examples = build_examples(sessions, EXAMPLES)
-    system_prompt = SYSTEM.format(name=name, style=style, examples=render_examples(examples, name))
+    if FULL_HISTORY:
+        body = render_all(sessions, name)
+        shown = sum(len(ps) for t in sessions for _, ps in t)
+    else:
+        blocks = build_examples(sessions, EXAMPLES)
+        body = render_examples(blocks, name)
+        shown = sum(len(ps) for b in blocks for _, ps in b)
+    system_prompt = SYSTEM.format(name=name, style=style, examples=body)
 
     try:
         import anthropic
@@ -408,9 +436,30 @@ def main():
         )
 
     client = anthropic.Anthropic(api_key=key)
+
+    # A 5-minute cache is fine for a small prompt, but re-writing a full history
+    # after every idle gap is the single most expensive thing this script can do.
+    cache_control = {"type": "ephemeral", "ttl": "1h"} if FULL_HISTORY else {"type": "ephemeral"}
+
+    if FULL_HISTORY:
+        used = client.messages.count_tokens(
+            model=MODEL, system=system_prompt, messages=[{"role": "user", "content": "hey"}]
+        ).input_tokens
+        room = 1_000_000 - used
+        if room < 20_000:
+            sys.exit(
+                f"Full history is {used:,} tokens and won't leave room to reply "
+                f"({room:,} left of 1,000,000).\n"
+                "Set FULL_HISTORY = False and raise EXAMPLES instead."
+            )
+        print(
+            f"Full history: {used:,} tokens ({room:,} to spare). "
+            f"About ${used * 5 / 1_000_000 * 1.25:.2f} to start, "
+            f"${used * 5 / 1_000_000 * 0.10:.2f} per reply."
+        )
     history = []
 
-    print(f"\nLearned from {count:,} of your messages, {len(examples)} exchanges in the prompt.")
+    print(f"\nLearned from {count:,} of your messages; {shown:,} in the prompt.")
     print(f"You're texting as {other}; {name} replies as you.")
     print("Type /reset to start over, /style to see your profile, /quit to leave.\n")
 
@@ -456,7 +505,7 @@ def main():
                     {
                         "type": "text",
                         "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
+                        "cache_control": cache_control,
                     }
                 ],
                 messages=window[first:],
