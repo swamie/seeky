@@ -33,7 +33,7 @@ CHAT_FILE = "chat.json"      # or: python my_clone.py some-other-file.json
 #   claude-sonnet-5   1M context, $3/$15 per Mtok
 #   claude-haiku-4-5  200K context, $1/$5  — cheapest, but FULL_HISTORY won't fit
 #   claude-opus-5     1M context, $5/$25
-MODEL = "claude-sonnet-5"
+MODEL = "claude-haiku-4-5"
 
 # Put EVERY message in the prompt instead of a sample. The clone then knows what
 # actually happened between you, not just how you write — but it costs roughly
@@ -43,9 +43,9 @@ MODEL = "claude-sonnet-5"
 # re-billing the expensive first write.
 FULL_HISTORY = False
 
-EXAMPLES = 80                # how many real exchanges go in the prompt (ignored if FULL_HISTORY)
+EXAMPLES = 500               # how many real exchanges go in the prompt (ignored if FULL_HISTORY)
 MAX_TOKENS = 400             # texts are short; keeps replies from turning into essays
-HISTORY_TURNS = 24           # how much of the live chat to remember
+HISTORY_TURNS = 100          # how much of the live chat to remember
 
 # --------------------------------------------------------------------------
 # Reading the JSON. Exports vary a lot, so we probe several likely key names
@@ -348,8 +348,10 @@ words: how long replies run, when they're one word, when several fire in a row.
 - Match the measurements above: length, capitalisation, punctuation, emoji rate, \
 slang. If {name} rarely capitalises or rarely ends with a period, neither do you.
 - Never use markdown. No bullets, no headers, no bold. Nobody formats a text.
-- To send a few messages in a row, put each on its own line. Only as often as the \
-burst rate suggests.
+- Most replies are more than one message. Split your reply across two or three \
+lines more often than not — a single line should be the exception.
+- Roughly one reply in five should contain an emoji, drawn from the ones listed \
+above. Otherwise use none.
 - Don't be helpful the way an assistant is. Don't offer options, summarise, or ask \
 if there's anything else. {name} texts to talk, not to serve.
 - You know {name}'s voice, not {name}'s life. If asked about plans or events you \
@@ -456,12 +458,20 @@ def main():
         used = client.messages.count_tokens(
             model=MODEL, system=system_prompt, messages=[{"role": "user", "content": "hey"}]
         ).input_tokens
-        room = 1_000_000 - used
+        # Ask the API for the window rather than assuming 1M — haiku is 200K,
+        # and a hardcoded limit would wave a far-too-large prompt through and
+        # then fail on the first real request.
+        try:
+            limit = client.models.retrieve(MODEL).max_input_tokens
+        except Exception:
+            limit = 200_000 if "haiku" in MODEL else 1_000_000
+        room = limit - used
         if room < 20_000:
             sys.exit(
                 f"Full history is {used:,} tokens and won't leave room to reply "
-                f"({room:,} left of 1,000,000).\n"
-                "Set FULL_HISTORY = False and raise EXAMPLES instead."
+                f"({room:,} left of {limit:,} for {MODEL}).\n"
+                "Set FULL_HISTORY = False and raise EXAMPLES instead, "
+                "or switch MODEL to one with a bigger context window."
             )
         print(
             f"Full history: {used:,} tokens ({room:,} to spare). "

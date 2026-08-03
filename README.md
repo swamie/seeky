@@ -89,6 +89,32 @@ Two things to know before flipping it:
 Raising `EXAMPLES` is usually the better move: 500 examples is 7% of your history
 for under 4c a reply.
 
+## Tuning, measured
+
+Defaults are `claude-haiku-4-5`, `EXAMPLES = 500`, `HISTORY_TURNS = 100`.
+
+Style fidelity was benchmarked over 36 prompts against a 33,285-message profile.
+Error is the summed distance from the real person on words per message, emoji
+rate, and messages per reply — lower is better.
+
+| config | words | emoji | bubbles | error |
+|---|---|---|---|---|
+| *the real person* | 4.2 | 10% | 1.88 | — |
+| 80 examples | 3.5 | 6% | 1.33 | 49 |
+| 500 examples | 3.5 | 5% | 1.19 | 59 |
+| 80 examples + burst/emoji rules | 3.3 | 1% | 1.94 | 34 |
+| **500 examples + rules (default)** | 3.3 | 6% | **1.89** | **26** |
+
+Two things worth knowing before you tune:
+
+- **Raising `EXAMPLES` alone does nothing.** 500 measured slightly *worse* than
+  80 until the prompt also carried explicit burst and emoji rules. The voice
+  signal saturates early; what was actually missing was instruction, not data.
+- **Models under-burst.** Every model tested sent ~1.3 messages per reply
+  against a real 1.88, and stayed at 100% lowercase where the real person is at
+  93%. They follow a style card more consistently than people follow their own
+  habits.
+
 ## Which model
 
 Default is `claude-sonnet-5` (line 36). Copying short casual texts turns out not
