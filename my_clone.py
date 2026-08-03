@@ -26,7 +26,14 @@ from pathlib import Path
 API_KEY = ""
 
 CHAT_FILE = "chat.json"      # or: python my_clone.py some-other-file.json
-MODEL = "claude-opus-5"
+# Imitating short casual texts doesn't reward a bigger model — measured against
+# 33k real messages, sonnet and haiku matched opus on style and haiku was
+# actually closest on message length. Sonnet is the value pick: same 1M context
+# as opus (so FULL_HISTORY still works) at a lower price.
+#   claude-sonnet-5   1M context, $3/$15 per Mtok
+#   claude-haiku-4-5  200K context, $1/$5  — cheapest, but FULL_HISTORY won't fit
+#   claude-opus-5     1M context, $5/$25
+MODEL = "claude-sonnet-5"
 
 # Put EVERY message in the prompt instead of a sample. The clone then knows what
 # actually happened between you, not just how you write — but it costs roughly
@@ -441,6 +448,10 @@ def main():
     # after every idle gap is the single most expensive thing this script can do.
     cache_control = {"type": "ephemeral", "ttl": "1h"} if FULL_HISTORY else {"type": "ephemeral"}
 
+    # Haiku 4.5 rejects the effort parameter outright ("This model does not
+    # support the effort parameter"), so only send it where it exists.
+    effort = {} if "haiku" in MODEL else {"output_config": {"effort": "low"}}
+
     if FULL_HISTORY:
         used = client.messages.count_tokens(
             model=MODEL, system=system_prompt, messages=[{"role": "user", "content": "hey"}]
@@ -509,10 +520,10 @@ def main():
                     }
                 ],
                 messages=window[first:],
-                # Thinking is on by default on this model. For texting it just
+                # Thinking is on by default on the 5-series. For texting it just
                 # adds latency and over-considered replies.
                 thinking={"type": "disabled"},
-                output_config={"effort": "low"},
+                **effort,
             ) as stream:
                 message = stream.get_final_message()
         except Exception as exc:

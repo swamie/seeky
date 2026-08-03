@@ -89,6 +89,31 @@ Two things to know before flipping it:
 Raising `EXAMPLES` is usually the better move: 500 examples is 7% of your history
 for under 4c a reply.
 
+## Which model
+
+Default is `claude-sonnet-5` (line 36). Copying short casual texts turns out not
+to reward a bigger model. Measured on 12 prompts against a 33,285-message
+profile:
+
+| | words/msg | no punctuation | lowercase | bubbles |
+|---|---|---|---|---|
+| **the real person** | 4.2 | 97% | 93% | 1.88 |
+| `claude-sonnet-5` | 2.5 | 100% | 100% | 1.83 |
+| `claude-haiku-4-5` | **3.3** | 100% | 100% | 1.58 |
+| `claude-opus-5` | 2.3 | 100% | 100% | 1.83 |
+
+Haiku came closest on message length; Opus matched best on burst rate. The gaps
+are small, so pick on price and context:
+
+- **`claude-sonnet-5`** — 1M context, $3/$15 per Mtok. `FULL_HISTORY` works.
+- **`claude-haiku-4-5`** — 200K context, $1/$5. Cheapest, but `FULL_HISTORY`
+  won't fit, and it rejects the `effort` parameter (the script omits it
+  automatically for haiku).
+- **`claude-opus-5`** — 1M context, $5/$25. No measurable gain here.
+
+All three overshoot on consistency — 100% lowercase where the real person is at
+93%. Models keep a rule better than people do.
+
 ## Notes
 
 - **Your messages get sent to the API** as part of the prompt — including your
