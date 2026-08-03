@@ -11,3 +11,6 @@ export/
 exports/
 MySignalExport/
 signal-export/
+
+# Local API key file — never commit this.
+key.txt

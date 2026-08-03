@@ -20,6 +20,11 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+# Paste your API key between the quotes. Leave it empty to use a key.txt file
+# next to this script, or the ANTHROPIC_API_KEY environment variable.
+# This repo is public — if you paste a key here, don't commit the change.
+API_KEY = ""
+
 CHAT_FILE = "chat.json"      # or: python my_clone.py some-other-file.json
 MODEL = "claude-opus-5"
 EXAMPLES = 80                # how many real exchanges go in the prompt
@@ -385,10 +390,17 @@ def main():
         import anthropic
     except ImportError:
         sys.exit("pip install anthropic")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("Warning: ANTHROPIC_API_KEY is not set.\n", file=sys.stderr)
+    key_file = Path(__file__).parent / "key.txt"
+    key = API_KEY.strip() or (
+        key_file.read_text(encoding="utf-8").strip() if key_file.exists() else ""
+    ) or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        sys.exit(
+            "No API key. Either paste one into API_KEY at the top of this file, "
+            "save it in key.txt next to this script, or set ANTHROPIC_API_KEY."
+        )
 
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=key)
     history = []
 
     print(f"\nLearned from {count:,} of your messages, {len(examples)} exchanges in the prompt.")
