@@ -4,13 +4,31 @@ __pycache__/
 venv/
 env/
 
-# Never commit message exports — these are your actual conversations.
+# Never commit message exports — these are real private conversations, and this
+# repo may be public. Signal exports are frequently JSON Lines or plain text, so
+# *.json alone is not enough: chat.jsonl would sail straight past it.
 *.json
-!package.json
+*.jsonl
+*.ndjson
+*.csv
+*.tsv
+*.txt
+*.bak
+*.zip
+*.tar
+*.tar.gz
+*.db
+*.sqlite
+*.sqlite3
 export/
 exports/
+data/
 MySignalExport/
 signal-export/
+
+# Project files that must stay tracked despite the blanket rules above.
+!requirements.txt
+!.gitignore
 
 # Local API key file — never commit this.
 key.txt
