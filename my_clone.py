@@ -1,336 +1,412 @@
-"""A chatbot that texts the way you do, built from your Signal export.
+"""A chatbot that texts like you, built from your own chat history.
 
-Anthropic doesn't offer self-serve fine-tuning, so this uses few-shot prompting
-instead: your real exchanges go into the system prompt and Claude imitates the
-voice it reads there. With a 1M-token context window there's plenty of room for
-a large, representative sample.
+Put your chat export next to this file as chat.json, then:
 
-    python my_clone.py --export C:\\Temp\\MySignalExport --name Kay
+    python my_clone.py
 
-Type /help once you're in.
+That's it. The first run shows you the names it found and asks which one is you.
+
+Claude has no self-serve fine-tuning, so this works by few-shot prompting: your
+real messages go into the system prompt and Claude imitates the voice it reads.
 """
 
 from __future__ import annotations
 
-import argparse
+import json
 import os
 import re
+import statistics
 import sys
-from dataclasses import dataclass
+from collections import Counter
+from pathlib import Path
 
-import signal_parser as sp
-
+CHAT_FILE = "chat.json"      # or: python my_clone.py some-other-file.json
 MODEL = "claude-opus-5"
+EXAMPLES = 80                # how many real exchanges go in the prompt
+MAX_TOKENS = 400             # texts are short; keeps replies from turning into essays
+HISTORY_TURNS = 24           # how much of the live chat to remember
 
-# Texts are short, so a small cap keeps replies from drifting into essays.
-MAX_TOKENS = 400
+# --------------------------------------------------------------------------
+# Reading the JSON. Exports vary a lot, so we probe several likely key names
+# rather than assuming one exact schema.
+# --------------------------------------------------------------------------
 
-# How many prior turns of the live conversation to resend. The API is
-# stateless, so this is the memory knob — and the cost knob.
-HISTORY_TURNS = 24
+BODY_KEYS = ("body", "text", "message", "content", "messageText")
+SENDER_KEYS = ("sender", "name", "from", "author", "sender_name", "senderName")
+TIME_KEYS = ("timestamp", "sent_at", "sentAt", "timestamp_ms", "date", "sent", "time")
+SKIP_TEXT = {"", "media message", "attachment", "sticker", "(no text)", "null", "none"}
 
-# Opus 5 with thinking disabled can occasionally leak internal XML into the
-# visible response. The system prompt asks it not to; this is the backstop.
-LEAKED_TAG_RE = re.compile(r"<thinking>.*?</thinking>\s*", re.DOTALL | re.IGNORECASE)
-STRAY_TAG_RE = re.compile(r"</?(thinking|antml:[a-z_]+)>", re.IGNORECASE)
+EMOJI_RE = re.compile(
+    "[\U0001f300-\U0001faff\U00002600-\U000027bf\U0001f1e6-\U0001f1ff"
+    "\U00002b00-\U00002bff\U0000fe0f\U00002190-\U000021ff]"
+)
+WORD_RE = re.compile(r"[a-z']{2,}")
+LEAKED_TAGS = re.compile(r"<thinking>.*?</thinking>\s*", re.DOTALL | re.IGNORECASE)
+STRAY_TAGS = re.compile(r"</?(thinking|antml:[a-z_]+)>", re.IGNORECASE)
+
+STOPWORDS = {
+    "the", "and", "you", "that", "for", "are", "but", "not", "with", "was",
+    "have", "this", "just", "its", "it's", "what", "your", "they", "then",
+    "there", "were", "from", "will", "would", "can", "did", "how", "all",
+    "get", "got", "out", "one", "about", "when", "them", "want", "she", "his",
+    "her", "him", "has", "had", "who", "why", "our", "off", "too", "any",
+    "some", "than", "into", "been", "more", "come", "know", "like", "think",
+}
+SLANG = {
+    "lol", "lmao", "lmfao", "haha", "hahaha", "hehe", "idk", "idc", "tbh",
+    "ngl", "fr", "frfr", "bruh", "bro", "dude", "omg", "wtf", "smh", "ig",
+    "imo", "rn", "btw", "nvm", "ty", "np", "yeah", "yea", "ya", "nah", "nope",
+    "yep", "yup", "ok", "okay", "kk", "sry", "sorry", "pls", "plz", "thx",
+    "u", "ur", "yall", "gonna", "wanna", "gotta", "kinda", "sorta", "prob",
+    "probs", "def", "af", "istg", "wyd", "hbu", "lowkey", "deadass", "bet",
+    "babe", "baby", "love", "miss", "cute", "aww", "xx",
+}
 
 
-SYSTEM_TEMPLATE = """\
+def find_messages(obj):
+    """Dig the message list out of whatever shape the JSON happens to be."""
+    if isinstance(obj, list):
+        msgs = [m for m in obj if isinstance(m, dict) and any(k in m for k in BODY_KEYS)]
+        if msgs:
+            return msgs
+        found = []
+        for item in obj:
+            found.extend(find_messages(item))
+        return found
+    if isinstance(obj, dict):
+        for key in ("messages", "conversation", "chat", "data"):
+            if key in obj:
+                found = find_messages(obj[key])
+                if found:
+                    return found
+        found = []
+        for value in obj.values():
+            found.extend(find_messages(value))
+        return found
+    return []
+
+
+def field(msg, keys):
+    for key in keys:
+        if key in msg and msg[key] not in (None, ""):
+            return msg[key]
+    return None
+
+
+def text_of(msg):
+    value = field(msg, BODY_KEYS)
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return "" if value.lower() in SKIP_TEXT else value
+
+
+def time_of(msg):
+    value = field(msg, TIME_KEYS)
+    if isinstance(value, (int, float)):
+        return float(value) / 1000 if value > 1e11 else float(value)
+    if isinstance(value, str):
+        try:
+            from datetime import datetime
+
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def sender_of(msg):
+    """Who sent this. Explicit direction fields win over the name field."""
+    for key in ("isFromMe", "fromMe", "from_me", "is_from_me"):
+        if isinstance(msg.get(key), bool):
+            return "__me__" if msg[key] else "__them__"
+    kind = msg.get("type") or msg.get("direction")
+    if isinstance(kind, str):
+        if kind.strip().lower() in ("outgoing", "sent", "out"):
+            return "__me__"
+        if kind.strip().lower() in ("incoming", "received", "in"):
+            return "__them__"
+    value = field(msg, SENDER_KEYS)
+    return str(value).strip() if value else ""
+
+
+# --------------------------------------------------------------------------
+# Turning messages into turns, and turns into examples
+# --------------------------------------------------------------------------
+
+
+def build_turns(messages, me):
+    """Group into sessions, then into speaker turns (a burst of texts = one turn)."""
+    rows = []
+    for msg in messages:
+        body = text_of(msg)
+        who = sender_of(msg)
+        if body and who:
+            rows.append((time_of(msg), "me" if who == me else "them", body))
+    rows.sort(key=lambda r: r[0])
+
+    sessions, current, prev = [], [], None
+    for stamp, speaker, body in rows:
+        if prev and stamp and prev > 0 and stamp - prev > 6 * 3600:
+            sessions.append(current)
+            current = []
+        if current and current[-1][0] == speaker:
+            current[-1][1].append(body)
+        else:
+            current.append([speaker, [body]])
+        prev = stamp
+    if current:
+        sessions.append(current)
+    return sessions
+
+
+def build_examples(sessions, limit):
+    """Blocks that start with them and end with you. Never overlapping."""
+    blocks = []
+    for turns in sessions:
+        used = -1
+        for i, (speaker, _) in enumerate(turns):
+            if speaker != "me" or i == 0 or turns[i - 1][0] != "them":
+                continue
+            start = max(used + 1, i - 5)
+            while start < i and turns[start][0] != "them":
+                start += 1
+            if start >= i:
+                continue
+            block = turns[start : i + 1]
+            if sum(len(p) for _, parts in block for p in parts) > 1200:
+                continue
+            blocks.append(block)
+            used = i
+    if len(blocks) <= limit:
+        return blocks
+    # Sample evenly across the whole history so the mix of long and one-word
+    # replies stays true to life, instead of just taking the oldest ones.
+    step = len(blocks) / limit
+    return [blocks[int(i * step)] for i in range(limit)]
+
+
+def style_card(sessions, name):
+    """Measured facts about how you text. These steer the model harder than
+    any amount of 'text casually' hand-waving."""
+    turns = [t for s in sessions for t in s if t[0] == "me"]
+    msgs = [p for _, parts in turns for p in parts]
+    if not msgs:
+        return None, 0
+
+    pct = lambda n: round(100 * n / len(msgs), 1)
+    starts = [m for m in msgs if m[:1].isalpha()]
+    emoji = Counter()
+    with_emoji = 0
+    for m in msgs:
+        hits = EMOJI_RE.findall(m)
+        if hits:
+            with_emoji += 1
+            emoji.update(hits)
+    words = Counter()
+    for m in msgs:
+        words.update(WORD_RE.findall(m.lower()))
+    slang = [(w, c) for w, c in words.most_common() if w in SLANG][:12]
+    common = [w for w, _ in words.most_common() if w not in STOPWORDS and w not in SLANG][:12]
+
+    lines = [
+        f"- Measured from {len(msgs):,} real messages sent by {name}.",
+        f"- Typical message: {int(statistics.median(len(m.split()) for m in msgs))} words / "
+        f"{int(statistics.median(len(m) for m in msgs))} characters. "
+        f"{pct(sum(1 for m in msgs if len(m.split()) <= 1))}% are a single word.",
+        f"- Sends {round(len(msgs) / len(turns), 2)} messages in a row before waiting for a reply.",
+        f"- Starts with a lowercase letter "
+        f"{round(100 * sum(1 for m in starts if m[0].islower()) / len(starts), 1) if starts else 0}% "
+        "of the time.",
+        f"- Ends with no punctuation {pct(sum(1 for m in msgs if m[-1] not in '.?!…'))}% of the time "
+        f"(period {pct(sum(1 for m in msgs if m.endswith('.')))}%, "
+        f"question mark {pct(sum(1 for m in msgs if m.endswith('?')))}%).",
+        f"- Uses emoji in {pct(with_emoji)}% of messages"
+        + (f"; most used: {' '.join(e for e, _ in emoji.most_common(6))}." if emoji else "."),
+    ]
+    if slang:
+        lines.append("- Habitual words: " + ", ".join(f"{w} ({c})" for w, c in slang))
+    if common:
+        lines.append("- Also says a lot: " + ", ".join(common))
+    return "\n".join(lines), len(msgs)
+
+
+def render_examples(blocks, name):
+    out = []
+    for i, block in enumerate(blocks, 1):
+        lines = [f'<exchange id="{i}">']
+        for speaker, parts in block:
+            who = name if speaker == "me" else "THEM"
+            lines.extend(f"{who}: {p}" for p in parts)
+        lines.append("</exchange>")
+        out.append("\n".join(lines))
+    return "\n\n".join(out)
+
+
+SYSTEM = """\
 You are texting as {name}. Everything below was measured or copied from {name}'s \
-real message history. Your job is to reply the way {name} actually would.
+real messages. Reply the way {name} actually would.
 
 # How {name} texts
 
-{style_card}
+{style}
 
 # Real conversations
 
-Each block is a genuine exchange. THEM is whoever {name} was talking to; \
-{name} is you. Note the rhythm as much as the wording — how long replies run, \
-when they're one word, when several messages fire in a row.
+THEM is the person {name} was talking to. Notice the rhythm as much as the \
+words: how long replies run, when they're one word, when several fire in a row.
 
 {examples}
 
 # How to reply
 
-- Write only what {name} would send. No narration, no stage directions, no \
-quotation marks around the message.
-- Match the measurements above: the length, the capitalisation, the punctuation \
-habits, the emoji rate, the slang. If {name} rarely capitalises or rarely ends \
-with a period, neither do you.
-- Never use markdown. No headers, no bullet points, no bold, no numbered lists. \
-Nobody formats a text message.
-- To send several messages in a row, put each one on its own line. Only do this \
-as often as the burst rate above suggests.
-- Don't be helpful in the way an assistant is helpful. Don't offer options, \
-summarise what was said, ask if there's anything else, or end with a question \
-you only asked to keep things going. {name} texts to talk, not to serve.
-- You know {name}'s voice, not {name}'s life. If asked about specific plans, \
-people, or events you have no evidence for, deflect the way a real person does \
-when they're distracted or don't feel like getting into it. Do not invent \
-detailed facts about {name}.
-- If someone sincerely asks whether they're talking to a real person or to an \
-AI, tell them the truth. Style imitation is the point; deceiving someone about \
-what they're talking to is not.
+- Write only what {name} would send. No narration, no quotation marks.
+- Match the measurements above: length, capitalisation, punctuation, emoji rate, \
+slang. If {name} rarely capitalises or rarely ends with a period, neither do you.
+- Never use markdown. No bullets, no headers, no bold. Nobody formats a text.
+- To send a few messages in a row, put each on its own line. Only as often as the \
+burst rate suggests.
+- Don't be helpful the way an assistant is. Don't offer options, summarise, or ask \
+if there's anything else. {name} texts to talk, not to serve.
+- You know {name}'s voice, not {name}'s life. If asked about plans or events you \
+have no evidence for, deflect like a real person would. Don't invent details.
+- If someone sincerely asks whether they're talking to a person or an AI, tell \
+them the truth.
 - Do not include internal or system XML tags in your response.
 """
 
 
-@dataclass
-class CloneConfig:
-    name: str
-    system_prompt: str
-    model: str = MODEL
-    effort: str = "low"
-    thinking: bool = False
-    max_tokens: int = MAX_TOKENS
+def choose_me(messages):
+    """Work out which sender is you, asking if it isn't obvious."""
+    counts = Counter(sender_of(m) for m in messages if text_of(m) and sender_of(m))
+    if not counts:
+        sys.exit(f"No messages with readable text found in {CHAT_FILE}.")
+    if "__me__" in counts:
+        return "__me__", counts  # the export already marks your own messages
+
+    people = counts.most_common()
+    if len(people) == 1:
+        return people[0][0], counts
+
+    print("Found these people in the chat:")
+    for i, (who, count) in enumerate(people, 1):
+        print(f"  {i}. {who} ({count:,} messages)")
+    while True:
+        pick = input(f"Which one is you? [1-{len(people)}]: ").strip()
+        if pick.isdigit() and 1 <= int(pick) <= len(people):
+            return people[int(pick) - 1][0], counts
+        print("Pick a number from the list.")
 
 
-def build_system_prompt(summary: sp.ExportSummary, name: str) -> str:
-    return SYSTEM_TEMPLATE.format(
-        name=name,
-        style_card=sp.render_style_card(summary.profile, name),
-        examples=sp.render_exchanges(summary.examples, name),
-    )
-
-
-def sanitise(text: str) -> str:
-    text = LEAKED_TAG_RE.sub("", text)
-    text = STRAY_TAG_RE.sub("", text)
-    return text.strip()
-
-
-class Clone:
-    """Wraps the Messages API call and the running conversation history."""
-
-    def __init__(self, client, config: CloneConfig):
-        self.client = client
-        self.config = config
-        self.history: list[dict] = []
-        # Flipped off permanently if the account or SDK rejects the parameter.
-        self._fallbacks_enabled = True
-
-    def _window(self) -> list[dict]:
-        """The tail of the conversation to resend, always starting on a user turn.
-
-        A plain ``history[-N:]`` slice can land on an assistant message, which
-        the API rejects — and only once the chat is long enough to trim, so it
-        fails well after everything looked fine.
-        """
-        window = self.history[-HISTORY_TURNS:]
-        first_user = next((i for i, m in enumerate(window) if m["role"] == "user"), None)
-        return window[first_user:] if first_user is not None else []
-
-    def _request_kwargs(self) -> dict:
-        kwargs: dict = {
-            "model": self.config.model,
-            "max_tokens": self.config.max_tokens,
-            # A single cached block: the style card and every example sit in a
-            # stable prefix, so each turn after the first reads them at ~10% of
-            # input price instead of reprocessing the whole transcript.
-            "system": [
-                {
-                    "type": "text",
-                    "text": self.config.system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            "messages": self._window(),
-            "output_config": {"effort": self.config.effort},
-        }
-        # Thinking is on by default on Opus 5. For imitating texting it mostly
-        # adds latency and over-considered replies, so it's off unless asked
-        # for. Disabling requires effort of "high" or lower.
-        if self.config.thinking:
-            kwargs["thinking"] = {"type": "adaptive"}
-        elif self.config.effort in ("low", "medium", "high"):
-            kwargs["thinking"] = {"type": "disabled"}
-        return kwargs
-
-    def _stream(self, kwargs: dict):
-        if self._fallbacks_enabled:
-            try:
-                return self.client.beta.messages.stream(
-                    **kwargs,
-                    betas=["server-side-fallback-2026-07-01"],
-                    # Opus 5's safety classifiers can decline a request; this
-                    # re-runs it on a fallback model server-side instead of
-                    # returning an empty reply.
-                    extra_body={"fallbacks": "default"},
-                )
-            except Exception:
-                self._fallbacks_enabled = False
-        return self.client.messages.stream(**kwargs)
-
-    def reply(self, user_text: str) -> str:
-        self.history.append({"role": "user", "content": user_text})
-        kwargs = self._request_kwargs()
-
-        try:
-            with self._stream(kwargs) as stream:
-                message = stream.get_final_message()
-        except Exception:
-            # Don't leave a dangling user turn — the next attempt would send
-            # two user messages in a row and get a confused reply.
-            self.history.pop()
-            raise
-
-        if getattr(message, "stop_reason", None) == "refusal":
-            self.history.pop()
-            return "[declined — safety classifiers blocked that one; try rephrasing]"
-
-        text = sanitise(
-            "".join(block.text for block in message.content if block.type == "text")
+def main():
+    path = Path(sys.argv[1] if len(sys.argv) > 1 else CHAT_FILE)
+    if not path.exists():
+        sys.exit(
+            f"Can't find {path}.\n"
+            f"Put your chat export next to this script as {CHAT_FILE}, "
+            f"or run: python my_clone.py path/to/your-file.json"
         )
-        if not text:
-            self.history.pop()
-            return "[empty reply — try again]"
-
-        self.history.append({"role": "assistant", "content": text})
-        return text
-
-    def reset(self) -> None:
-        self.history.clear()
-
-
-HELP = """\
-  /reset    forget the current conversation (style prompt stays loaded)
-  /style    show the measured style profile
-  /prompt   print the full system prompt being sent
-  /quit     exit
-"""
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--export", required=True, help="Signal export directory or a single .json file"
-    )
-    parser.add_argument("--name", default="You", help="Your name, used in the prompt")
-    parser.add_argument(
-        "--me", default="Me", help="How you appear in the export's sender field (default: Me)"
-    )
-    parser.add_argument("--contact", help="Only learn from conversations matching this name")
-    parser.add_argument(
-        "--max-examples", type=int, default=80, help="Exchanges to include (default: 80)"
-    )
-    parser.add_argument("--model", default=MODEL)
-    parser.add_argument(
-        "--effort",
-        default="low",
-        choices=["low", "medium", "high"],
-        help="Higher is slower and pricier; texting rarely needs more than low",
-    )
-    parser.add_argument(
-        "--thinking", action="store_true", help="Let Claude think before replying"
-    )
-    parser.add_argument("--show-prompt", action="store_true", help="Print the prompt and exit")
-    parser.add_argument("--tokens", action="store_true", help="Report system prompt token count")
-    args = parser.parse_args()
 
     try:
-        summary = sp.analyse_export(
-            args.export,
-            me_names={args.me},
-            contact=args.contact,
-            max_examples=args.max_examples,
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"Could not read the export: {exc}", file=sys.stderr)
-        return 1
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        sys.exit(f"{path} isn't valid JSON: {exc}")
 
-    if not summary.profile.message_count:
-        seen = "\n".join(f"  {c:>6,}  {s}" for s, c in summary.senders[:15])
-        print(
-            f"Found conversations but no messages from {args.me!r}.\n"
-            f"Sender names in this export:\n{seen or '  (none)'}\n"
-            "Pass one of these as --me.",
-            file=sys.stderr,
-        )
-        return 1
+    messages = find_messages(data)
+    if not messages:
+        sys.exit(f"Couldn't find any messages in {path}. Is this a chat export?")
 
-    system_prompt = build_system_prompt(summary, args.name)
+    me, counts = choose_me(messages)
+    name = input("What should the clone be called? [me]: ").strip() or "me"
 
-    if args.show_prompt:
-        print(system_prompt)
-        return 0
+    sessions = build_turns(messages, me)
+    style, count = style_card(sessions, name)
+    if not style:
+        sys.exit(f"Found {len(messages)} messages but none from you. Try again and pick a different person.")
+
+    examples = build_examples(sessions, EXAMPLES)
+    system_prompt = SYSTEM.format(name=name, style=style, examples=render_examples(examples, name))
 
     try:
         import anthropic
     except ImportError:
-        print("pip install anthropic", file=sys.stderr)
-        return 1
-
+        sys.exit("pip install anthropic")
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        print(
-            "Note: ANTHROPIC_API_KEY isn't set. The SDK will fall back to an "
-            "`ant auth login` profile if you have one.",
-            file=sys.stderr,
-        )
+        print("Warning: ANTHROPIC_API_KEY is not set.\n", file=sys.stderr)
 
     client = anthropic.Anthropic()
-    config = CloneConfig(
-        name=args.name,
-        system_prompt=system_prompt,
-        model=args.model,
-        effort=args.effort,
-        thinking=args.thinking,
-    )
-    clone = Clone(client, config)
+    history = []
 
-    print(
-        f"Loaded {summary.profile.message_count:,} of your messages "
-        f"across {len(summary.conversations)} conversation(s); "
-        f"{len(summary.examples)} exchanges in the prompt."
-    )
-    if args.tokens:
-        try:
-            count = client.messages.count_tokens(
-                model=args.model,
-                system=system_prompt,
-                messages=[{"role": "user", "content": "hey"}],
-            )
-            print(f"System prompt: ~{count.input_tokens:,} input tokens per uncached turn.")
-        except Exception as exc:
-            print(f"(token count unavailable: {exc})")
-    print("/help for commands.\n")
+    print(f"\nLearned from {count:,} of your messages, {len(examples)} exchanges in the prompt.")
+    print("Type /reset to start over, /style to see your profile, /quit to leave.\n")
 
     while True:
         try:
-            user_text = input("you> ").strip()
+            said = input("you> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
-            return 0
-
-        if not user_text:
+            return
+        if not said:
             continue
-        if user_text in ("/quit", "/exit"):
-            return 0
-        if user_text == "/help":
-            print(HELP)
+        if said in ("/quit", "/exit"):
+            return
+        if said == "/reset":
+            history.clear()
+            print("(cleared)\n")
             continue
-        if user_text == "/reset":
-            clone.reset()
-            print("(conversation cleared)")
-            continue
-        if user_text == "/style":
-            print(sp.render_style_card(summary.profile, args.name))
-            continue
-        if user_text == "/prompt":
-            print(system_prompt)
+        if said == "/style":
+            print(style + "\n")
             continue
 
-        label = f"{args.name.lower()}> "
-        print(f"{label}...", end="", flush=True)
+        history.append({"role": "user", "content": said})
+
+        # Only resend the recent tail, and make sure it starts on a user turn —
+        # a plain slice can begin on an assistant message, which the API rejects.
+        window = history[-HISTORY_TURNS:]
+        first = next((i for i, m in enumerate(window) if m["role"] == "user"), 0)
+
+        # The "..." typing indicator is erased with \r, which only works on a
+        # real terminal — piped or redirected output would keep the artifact.
+        label = f"{name.lower()}> "
+        tty = sys.stdout.isatty()
+        erase = f"\r{' ' * (len(label) + 3)}\r" if tty else ""
+        if tty:
+            print(f"{label}...", end="", flush=True)
         try:
-            reply = clone.reply(user_text)
+            with client.messages.stream(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                # One cached block: every turn after the first reads the whole
+                # style prompt at a fraction of the input price.
+                system=[
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=window[first:],
+                # Thinking is on by default on this model. For texting it just
+                # adds latency and over-considered replies.
+                thinking={"type": "disabled"},
+                output_config={"effort": "low"},
+            ) as stream:
+                message = stream.get_final_message()
         except Exception as exc:
-            print(f"\r{' ' * (len(label) + 3)}\r", end="")
-            print(f"[error: {exc}]")
+            history.pop()
+            print(f"{erase}[error: {exc}]\n")
             continue
 
-        # Erase the typing indicator, then print each line as its own bubble.
-        print(f"\r{' ' * (len(label) + 3)}\r", end="")
+        reply = "".join(b.text for b in message.content if b.type == "text")
+        reply = STRAY_TAGS.sub("", LEAKED_TAGS.sub("", reply)).strip()
+
+        if message.stop_reason == "refusal" or not reply:
+            history.pop()
+            print(f"{erase}[no reply — try rephrasing]\n")
+            continue
+
+        history.append({"role": "assistant", "content": reply})
+        print(erase, end="")
         for i, line in enumerate(reply.splitlines()):
             if line.strip():
                 print(f"{label if i == 0 else ' ' * len(label)}{line}")
@@ -338,4 +414,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
